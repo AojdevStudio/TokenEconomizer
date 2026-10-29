@@ -38,11 +38,13 @@ named `rollout-*`; Copilot's session-state transcript, or no transcript at all i
 hook process; Claude Code otherwise. Each plugin hook file except Claude Code's also passes
 `--host` explicitly, so detection is the fallback rather than the rule.
 """
+import glob
 import json
 import os
 import re
 import shlex
 import time
+from datetime import datetime
 
 from .. import trace
 
@@ -190,6 +192,29 @@ class Host:
     def tool_usage(self, trace_path):
         return trace.tool_usage(trace_path)
 
+    # -- the sessions it ran before the plugin saw them, for `backfill` ----------------------
+    def history_logs(self, env):
+        """Every session log this agent keeps on this machine (none where none is read)."""
+        return []
+
+    def history_session(self, path):
+        """{session_id, cwd, started (epoch seconds or None), subagent} of one of those logs."""
+        return {}
+
+    def history_turns(self, path):
+        """[(payloads, stopped_normally)] per prompt-turn of a recorded session: its tool calls
+        as the PostToolUse payloads its hooks would have received, for `tool_call`."""
+        return []
+
+
+def _epoch(stamp):
+    """Epoch seconds of an ISO 8601 time, `Z` included (which Python 3.10 does not parse);
+    None when it is not one."""
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
 
 def _failure_response(p):
     """A PostToolUseFailure payload's `error` as a response; None for any other payload. A
@@ -258,6 +283,25 @@ class ClaudeCode(Host):
     def tool_usage(self, trace_path):
         return trace.claude_tool_usage(os.path.realpath(trace_path))
 
+    def history_logs(self, env):
+        # One transcript per session, in a folder named for where it started; a subagent's
+        # lives under its session's (`<id>/subagents/`), never at this level.
+        base = env.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+        return glob.glob(os.path.join(base, "projects", "*", "*.jsonl"))
+
+    def history_session(self, path):
+        h = trace.claude_session_header(path)
+        return {"session_id": h["session_id"], "cwd": h.get("cwd"),
+                "started": _epoch(h.get("started")), "subagent": h.get("sidechain", False)}
+
+    def history_turns(self, path):
+        # A call that failed reaches the hooks as PostToolUseFailure, its `error` the text the
+        # model saw ("Exit code 2\n..."), which is what the transcript records (2.1.299).
+        return [([dict({"tool_name": name, "tool_input": args},
+                       **({"error": text} if is_error else {"tool_response": text}))
+                  for name, args, text, is_error in t["calls"]], not t["interrupted"])
+                for t in trace.claude_prompt_turns(path)]
+
 
 _CODEX_SHELL = {"bash", "shell", "exec_command", "local_shell", "unified_exec",
                 "container.exec", "exec"}
@@ -308,6 +352,47 @@ class Codex(Host):
 
     def prompt_count(self, transcript_path):
         return trace.codex_prompt_count(transcript_path)
+
+    def history_logs(self, env):
+        base = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+        return glob.glob(os.path.join(base, "sessions", "**", "rollout-*.jsonl"), recursive=True)
+
+    def history_session(self, path):
+        h = trace.codex_session_header(path)
+        return dict(h, started=_epoch(h.get("started")))
+
+    def history_turns(self, path):
+        # PostToolUse names a command `Bash` with the script the model wrote, not the argv the
+        # rollout records (`bash -lc '<script>'`), and its output a plain string with no exit
+        # code (0.153.1); a file change comes as `apply_patch`, whose file headers are what
+        # `tool_call` reads of its patch. An MCP call is named as Claude Code names one (its
+        # Codex payload was not observed).
+        out = []
+        for t in trace.codex_prompt_turns(path):
+            payloads = []
+            for item in t["items"]:
+                if item["type"] == "command_execution":
+                    cmd = item.get("command") or ""
+                    try:
+                        argv = shlex.split(cmd)
+                    except ValueError:
+                        argv = []
+                    if (len(argv) == 3 and os.path.basename(argv[0]) in ("bash", "sh", "zsh")
+                            and argv[1].startswith("-") and "c" in argv[1]):
+                        cmd = argv[2]
+                    payloads.append({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                     "tool_response": item.get("aggregated_output") or ""})
+                elif item["type"] == "mcp_tool_call":
+                    payloads.append({"tool_name": f"mcp__{item.get('server')}__{item.get('tool')}",
+                                     "tool_input": {}, "tool_response": item.get("result")})
+                else:
+                    patch = "".join(f"*** Update File: {c['path']}\n"
+                                    for c in item.get("changes") or ()
+                                    if isinstance(c, dict) and c.get("path"))
+                    payloads.append({"tool_name": "apply_patch", "tool_input": {"input": patch},
+                                     "tool_response": ""})
+            out.append((payloads, not t["interrupted"]))
+        return out
 
 
 class Pi(Host):

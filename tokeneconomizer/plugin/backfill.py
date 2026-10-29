@@ -197,8 +197,14 @@ def run(ctx, announce=True):
                         "session_id": sid, "host": ctx.host.name, "origin": "backfill",
                         "cwd": info.get("cwd"), "transcript": path, "started": started,
                         "ended": os.path.getmtime(path), "turns": [], "replayed": False})
-                rec = fold.fold_session(ctx, sid, path, held=True)
-                n += rec is not None and kind != "again"
+                if fold.fold_session(ctx, sid, path, held=True) is None or kind == "again":
+                    continue
+                n += 1
+                if announce:
+                    # Counted as each is read, so a job killed later still has them announced.
+                    doc = ctx.store.read(STATE) or {}
+                    ctx.store.write(STATE, dict(doc, unannounced=int(doc.get("unannounced") or 0)
+                                                + 1))
         if ctx.config.loopguard != "off":
             recs = _records(ctx)
             for sid, rec in sorted(recs.items(), key=lambda kv: float(kv[1].get("started") or 0)):
@@ -208,11 +214,7 @@ def run(ctx, announce=True):
                     ctx.store.write(os.path.join("sessions", f"{sid}.json"),
                                     dict(rec, replayed=True))
         doc = ctx.store.read(STATE) or {}
-        # Added to what a run before it read and no session start has announced yet: a second
-        # job left by a concurrent start finds nothing, and must not erase the first one's count.
-        ctx.store.write(STATE, dict(doc, finished=time.time(), read=n,
-                                    unannounced=int(doc.get("unannounced") or 0)
-                                    + (n if announce else 0)))
+        ctx.store.write(STATE, dict(doc, finished=time.time(), read=n))
         return n
 
 

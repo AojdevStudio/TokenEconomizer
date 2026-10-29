@@ -226,6 +226,24 @@ def test_a_session_recorded_by_a_killed_job_is_folded_by_the_next(env, repo, mon
     assert ctx.store.read("envelope.json")["resolved_turns"] == [2]
 
 
+def test_sessions_a_killed_job_read_are_still_announced(env, repo, monkeypatch):
+    for i in range(3):
+        past(env, repo, f"old{i}", 3 - i, [("go", edit_and_test(repo))])
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+    real = fold.fold_session
+
+    def killed_at_the_third(c, sid, *a, **k):
+        if sid == "old2":
+            raise KeyboardInterrupt
+        return real(c, sid, *a, **k)
+    monkeypatch.setattr(fold, "fold_session", killed_at_the_third)
+    with pytest.raises(KeyboardInterrupt):
+        backfill.run(ctx)
+    monkeypatch.undo()
+    assert backfill.run(ctx) == 1
+    assert "read 3 earlier" in backfill.notice(ctx, "te status")
+
+
 def test_a_backfilled_session_moved_by_a_merge_is_folded_again_where_it_lands(
         env, repo, tmp_path, monkeypatch):
     other = _git_repo(str(tmp_path / "other"), "https://github.com/acme/gadget.git")

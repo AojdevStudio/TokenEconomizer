@@ -123,14 +123,24 @@ def _records(ctx):
             for n in names if n.endswith(".json")}
 
 
+def _running(rec, log):
+    """Is this session still running, or running again after a resume? Its log was written
+    within `fold.STALE_S`, and it never ended, or its hooks wrote its record after it ended (an
+    ended session's last write is its SessionEnd's, within the same second)."""
+    if time.time() - os.path.getmtime(log) >= fold.STALE_S:
+        return False
+    ended = rec.get("ended")
+    return not ended or float(rec.get("updated") or 0) > float(ended) + 1
+
+
 def _unfold_after(ctx, since):
     """When a folded session started after `since`, and every folded session's log still exists
     to fold it again from: set the learned state aside and unmark them all, their ledger records
     dropped (their folds write them again). Returns [(started, session id, log)] to fold again,
     [] when the order holds already, or when a log is gone: then the history is folded after
     them, since folding again without that session would lose what it taught. None while one
-    of them is still running (a resumed session, its log written within `fold.STALE_S`): a fold
-    rewrites its record, which its hooks are writing too, so the run waits for a quiet moment.
+    of them is still running (`_running`, a resumed session): a fold rewrites its record, which
+    its hooks are writing too, so the run waits for it to end.
     The caller holds the fold lock."""
     folded = ctx.store.read("folded.json") or {}
     recs = _records(ctx)
@@ -143,7 +153,7 @@ def _unfold_after(ctx, since):
                             or ctx.host.history_session(log).get("started") or 0), sid, log))
     if not any(t > since for t, _, _ in again):
         return []
-    if any(time.time() - os.path.getmtime(log) < fold.STALE_S for _, _, log in again):
+    if any(_running(recs.get(sid, {}), log) for _, sid, log in again):
         return None
     ids = set(folded)
     with ctx.store.locked("mechanisms"):
@@ -182,14 +192,12 @@ def run(ctx, announce=True):
                 return None
             todo = [(t, sid, path, "new") for t, sid, path in window(ctx)]
             folded = ctx.store.read("folded.json") or {}
-            # What a killed run left unfolded: a session it recorded, or one its rebuild
-            # unmarked (read before, so not announced again). One whose log is being written
-            # was resumed, and its own end folds it.
+            # What a killed run left unfolded: a session it recorded (and counted), or one its
+            # rebuild unmarked (read before). A resumed one is left to its own end's fold.
             for sid, rec in _records(ctx).items():
                 log = rec.get("transcript") or ""
                 if sid not in folded and (rec.get("origin") == "backfill" or rec.get("unfolded")) \
-                        and os.path.exists(log) \
-                        and time.time() - os.path.getmtime(log) >= fold.STALE_S:
+                        and os.path.exists(log) and not _running(rec, log):
                     todo.append((float(rec.get("started") or 0), sid, log,
                                  "again" if rec.get("unfolded") else "stranded"))
             todo.sort()
@@ -204,14 +212,14 @@ def run(ctx, announce=True):
                         "session_id": sid, "host": ctx.host.name, "origin": "backfill",
                         "cwd": info.get("cwd"), "transcript": path, "started": started,
                         "ended": os.path.getmtime(path), "turns": [], "replayed": False})
-                if fold.fold_session(ctx, sid, path, held=True) is None or kind == "again":
-                    continue
-                n += 1
-                if announce:
-                    # Counted as each is read, so a job killed later still has them announced.
-                    doc = ctx.store.read(STATE) or {}
-                    ctx.store.write(STATE, dict(doc, unannounced=int(doc.get("unannounced") or 0)
-                                                + 1))
+                    n += 1
+                    if announce:
+                        # Counted once it has a record, whoever folds it (a killed job's next
+                        # run, or a session start's pending fold), so it is announced once.
+                        doc = ctx.store.read(STATE) or {}
+                        ctx.store.write(STATE, dict(
+                            doc, unannounced=int(doc.get("unannounced") or 0) + 1))
+                fold.fold_session(ctx, sid, path, held=True)
         if ctx.config.loopguard != "off":
             recs = _records(ctx)
             for sid, rec in sorted(recs.items(), key=lambda kv: float(kv[1].get("started") or 0)):

@@ -199,7 +199,11 @@ def test_with_a_folded_sessions_log_gone_history_is_added_without_a_rebuild(
 
 def test_a_rebuild_waits_while_a_session_it_would_fold_again_is_running(env, repo, tmp_path):
     logs = _upgrade(env, repo, tmp_path)
-    os.utime(logs[2])                                  # live2 was resumed, and is running
+    st = store_for(env, repo)
+    st.write("sessions/live2.json", dict(st.read("sessions/live2.json"),
+                                         ended=time.time() - 120))   # it ended two minutes ago
+    start(dict(env, TE_BACKFILL="off"), repo, "live2")               # and was resumed
+    os.utime(logs[2])
     ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
     before = ctx.store.read("sessions/live2.json")
     assert backfill.run(ctx) is None
@@ -207,6 +211,13 @@ def test_a_rebuild_waits_while_a_session_it_would_fold_again_is_running(env, rep
     assert [r["session_id"] for r in ledger(env, repo)] == [f"live{i}" for i in range(3)]
     os.utime(logs[2], (time.time() - DAY,) * 2)        # it ended
     assert backfill.run(ctx) == 5
+    assert [r["session_id"] for r in ledger(env, repo)][:5] == [f"trap{i}" for i in range(5)]
+
+
+def test_a_session_that_just_ended_does_not_hold_up_a_rebuild(env, repo, tmp_path):
+    logs = _upgrade(env, repo, tmp_path)
+    os.utime(logs[2])                                  # live2 ended a moment ago
+    start(env, repo)
     assert [r["session_id"] for r in ledger(env, repo)][:5] == [f"trap{i}" for i in range(5)]
 
 
@@ -221,7 +232,7 @@ def test_a_session_recorded_by_a_killed_job_is_folded_by_the_next(env, repo, mon
         backfill.run(ctx)
     monkeypatch.undo()
     assert ctx.store.read("sessions/old.json")["origin"] == "backfill"
-    assert backfill.run(ctx) == 1
+    assert backfill.run(ctx) == 0                       # read (and counted) by the first
     assert [r["session_id"] for r in ledger(env, repo)] == ["old"]
     assert ctx.store.read("envelope.json")["resolved_turns"] == [2]
 
@@ -240,7 +251,7 @@ def test_a_killed_rebuild_is_finished_by_the_next_run_and_announced_once(
     with pytest.raises(KeyboardInterrupt):
         backfill.run(ctx)
     monkeypatch.undo()
-    assert backfill.run(ctx) == 3
+    assert backfill.run(ctx) == 2
     assert [r["session_id"] for r in ledger(env, repo)] == [
         *(f"trap{i}" for i in range(5)), *(f"live{i}" for i in range(3))]
     assert "read 5 earlier" in backfill.notice(ctx, "te status")
@@ -254,7 +265,8 @@ def test_a_recorded_session_that_was_resumed_is_left_to_its_own_end(env, repo, m
     with pytest.raises(KeyboardInterrupt):
         backfill.run(ctx)
     monkeypatch.undo()
-    os.utime(log)                                      # resumed: its log is written again
+    os.utime(log)                                      # resumed: its log is written
+    start(env, repo, "old")                            # and its hooks write its record
     assert backfill.run(ctx) == 0
     assert ledger(env, repo) == []
 
@@ -273,8 +285,10 @@ def test_sessions_a_killed_job_read_are_still_announced(env, repo, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         backfill.run(ctx)
     monkeypatch.undo()
-    assert backfill.run(ctx) == 1
-    assert "read 3 earlier" in backfill.notice(ctx, "te status")
+    line = start(env, repo, "next")["systemMessage"]     # its pending fold folds the third
+    assert "read 3 earlier" in line
+    assert [r["session_id"] for r in ledger(env, repo)] == ["old0", "old1", "old2"]
+    assert backfill.run(ctx) == 0
 
 
 def test_a_backfilled_session_moved_by_a_merge_is_folded_again_where_it_lands(

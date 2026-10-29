@@ -7,6 +7,7 @@ The job runs inline (`TE_FOLD_SYNC=1`); in the plugin it is a detached `te backf
 """
 import json
 import os
+import re
 import time
 
 import pytest
@@ -34,8 +35,8 @@ def _iso(t):
 def past(env, cwd, sid, days_ago, prompts=(), writer=None, sidechain=False, path=None):
     """A Claude Code transcript of a session that started in `cwd` `days_ago` days ago, filed
     where Claude Code files it (or at `path`), its log last written ten minutes later."""
-    path = path or os.path.join(env["CLAUDE_CONFIG_DIR"], "projects", cwd.replace("/", "-"),
-                                f"{sid}.jsonl")
+    path = path or os.path.join(env["CLAUDE_CONFIG_DIR"], "projects",
+                                re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{sid}.jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     (writer or (lambda p: write_session(p, prompts)))(path)
     started = time.time() - days_ago * DAY
@@ -158,20 +159,20 @@ def test_past_turns_replay_through_the_guard_and_only_green_ones_feed_the_envelo
 
 
 def test_codex_rollouts_are_read_and_subagent_threads_are_not(env, repo):
-    def rollout(sid, days_ago, source="vscode"):
+    def rollout(sid, days_ago, source="vscode", items=None):
         d = os.path.join(env["CODEX_HOME"], "sessions", "2026", "10", "01")
         os.makedirs(d, exist_ok=True)
         when = time.time() - days_ago * DAY
-        item = {"type": "event_msg", "payload": {"type": "item_completed"}}
+        items = items or [
+            {"type": "FileChange", "id": "f", "status": "completed",
+             "changes": {f"{repo}/a.py": {"type": "update"}}},
+            {"type": "CommandExecution", "id": "c", "command": ["bash", "-lc", "pytest"],
+             "aggregated_output": "3 passed in 0.1s", "exit_code": 0}]
         recs = [{"type": "session_meta", "payload": {"id": sid, "cwd": repo, "source": source,
                                                      "timestamp": _iso(when)}},
                 {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
-                dict(item, payload=dict(item["payload"], item={
-                    "type": "FileChange", "id": "f", "status": "completed",
-                    "changes": {f"{repo}/a.py": {"type": "update"}}})),
-                dict(item, payload=dict(item["payload"], item={
-                    "type": "CommandExecution", "id": "c", "command": ["bash", "-lc", "pytest"],
-                    "aggregated_output": "3 passed in 0.1s", "exit_code": 0})),
+                *({"type": "event_msg", "payload": {"type": "item_completed", "item": it}}
+                  for it in items),
                 {"type": "event_msg", "payload": {"type": "token_count", "info": {
                     "total_token_usage": {"input_tokens": 3000, "cached_input_tokens": 2000,
                                           "output_tokens": 90}}}}]
@@ -179,13 +180,53 @@ def test_codex_rollouts_are_read_and_subagent_threads_are_not(env, repo):
         with open(path, "w") as fh:
             fh.write("\n".join(json.dumps(r) for r in recs) + "\n")
         os.utime(path, (when, when))
-    rollout("thread-a", 2)
-    rollout("thread-b", 1, source={"subagent": {"thread_spawn": {"parent_thread_id": "a"}}})
+    rollout("thread-a", 4)
+    rollout("thread-b", 3, source={"subagent": {"thread_spawn": {"parent_thread_id": "a"}}})
+    # The hook is given the script, not the rollout's argv: this failing run keeps it red.
+    rollout("thread-red", 2, items=[
+        {"type": "FileChange", "id": "f", "status": "completed",
+         "changes": {f"{repo}/a.py": {"type": "update"}}},
+        {"type": "CommandExecution", "id": "c", "command": ["bash", "-lc", "pytest -q"],
+         "aggregated_output": "1 failed, 2 passed in 0.1s", "exit_code": 1}])
+    rollout("thread-mcp", 1, items=[{"type": "McpToolCall", "id": "m", "server": "docs",
+                                     "tool": "search", "status": "completed", "result": "x"}])
     call(env, {"hook_event_name": "SessionStart", "session_id": "now", "source": "startup",
                "transcript_path": "", "cwd": repo}, "codex")
     assert [(r["session_id"], r["source"]) for r in ledger(env, repo, "codex")] == [
-        ("thread-a", "backfill")]
-    assert store_for(env, repo, "codex").read("envelope.json")["resolved_turns"] == [2]
+        ("thread-a", "backfill"), ("thread-red", "backfill"), ("thread-mcp", "backfill")]
+    assert store_for(env, repo, "codex").read("envelope.json")["resolved_turns"] == [2, 1]
+
+
+def test_sessions_without_tool_calls_never_fill_the_window(env, repo):
+    past(env, repo, "old-tools", 3, [("go", edit_and_test(repo))])
+    for sid in ("chat1", "chat2"):
+        past(env, repo, sid, 1, [("hello", [])])
+    store_for(env, repo).write("folded.json", {s: {"at": 1} for s in ("chat1", "chat2")})
+    start(dict(env, TE_BACKFILL_SESSIONS="2"), repo)
+    assert [r["session_id"] for r in ledger(env, repo)] == ["old-tools"]
+
+
+def test_a_job_after_the_first_keeps_its_notice(env, repo):
+    past(env, repo, "old", 1, [("go", edit_and_test(repo))])
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+    assert backfill.run(ctx) == 1
+    assert backfill.run(ctx) == 0                   # left by a concurrent session start
+    assert "read 1 earlier" in backfill.notice(ctx, "te status")
+
+
+def test_a_session_folded_by_a_killed_job_is_replayed_by_the_next(env, repo, monkeypatch):
+    past(env, repo, "old", 1, [("go", edit_and_test(repo))])
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+
+    def killed(*a):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backfill, "replay_turns", killed)
+    with pytest.raises(KeyboardInterrupt):
+        backfill.run(ctx)
+    monkeypatch.undo()
+    assert ctx.store.read("envelope.json") is None
+    assert backfill.run(ctx) == 0
+    assert ctx.store.read("envelope.json")["resolved_turns"] == [2]
 
 
 def test_a_second_job_leaves_while_one_runs(env, repo):

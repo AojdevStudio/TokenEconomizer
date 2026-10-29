@@ -20,8 +20,9 @@ Stop hooks would have.
     a session once whoever asks, so a run never double-counts one, and running again folds only
     what is still missing from the window.
   * One job at a time. `backfill.json` says a job was started and when it finished; concurrent
-    session starts may each leave one, and the job takes the `backfill` lock or leaves. A job
-    that died is started again by a session start `RESPAWN_S` later.
+    session starts may each leave one, and the job takes the `backfill` lock or leaves (or, run
+    after the first, reads nothing new). A job that died is started again by a session start
+    `RESPAWN_S` later.
 """
 import os
 import time
@@ -77,9 +78,8 @@ def window(ctx, now=None):
     for started, sid, path in sorted(found, reverse=True):
         if len(picked) >= ctx.config.backfill_sessions:
             break
-        done = sid in ids or os.path.realpath(path) in logs
-        if done or any(payloads for payloads, _ in ctx.host.history_turns(path)):
-            picked.append((started, sid, path, done))
+        if any(payloads for payloads, _ in ctx.host.history_turns(path)):
+            picked.append((started, sid, path, sid in ids or os.path.realpath(path) in logs))
     return [(sid, path) for _, sid, path, done in sorted(picked) if not done]
 
 
@@ -87,32 +87,53 @@ def replay_turns(ctx, path):
     """Each prompt-turn of a past session through the loop guard, as `controller` runs a live
     one: every call folded from the payload its PostToolUse hook would have received, and a turn
     that ended green (not interrupted, no failing check after its last edit) recorded in the
-    envelope. The session ran unguarded, so nothing is decided here: no envelope, no judge."""
-    for payloads, stopped in ctx.host.history_turns(path):
-        g = loopguard.TurnGuard()
-        for p in payloads:
-            g.fold(*ctx.host.tool_call(p))
-        if g.cum_turns and stopped:
-            loopguard.record_turn(ctx.store, g, level=ctx.config.loopguard_aggr,
-                                  overrides=ctx.config.loopguard_thresholds)
+    envelope as `loopguard.record_turn` records it, in one write for the whole session. The
+    session ran unguarded, so nothing is decided here: no envelope, no judge."""
+    with ctx.store.locked("envelope"):
+        tracker = loopguard.load_envelope(ctx.store, ctx.config.loopguard_aggr,
+                                          ctx.config.loopguard_thresholds)
+        for payloads, stopped in ctx.host.history_turns(path):
+            g = loopguard.TurnGuard()
+            for p in payloads:
+                g.fold(*ctx.host.tool_call(p))
+            if g.cum_turns and stopped:
+                tracker.update(g.cum_turns, g.resolved_proxy(), snapshot=g.whole.snapshot())
+        loopguard.save_envelope(ctx.store, tracker)
+
+
+def _backfilled(ctx, session_id):
+    return any(r.get("session_id") == session_id and r.get("source") == "backfill"
+               for r in ctx.store.read_lines("ledger.jsonl"))
 
 
 def run(ctx, announce=True):
     """Read the window's sessions. Returns how many were folded, or None while another run
-    holds the lock. With `announce`, the next session start says how many."""
+    holds the lock. With `announce`, the next session start says how many.
+
+    `replaying` in the state names the session between its fold and its turns' replay, so a run
+    killed there replays it at the next run: the fold marks it read, and nothing else would."""
     with ctx.store.locked("backfill", timeout=0) as got:
         if not got:
             return None
+        doc = ctx.store.read(STATE) or {}
+        cut = doc.get("replaying")
+        if cut and ctx.config.loopguard != "off" and _backfilled(ctx, cut["session_id"]):
+            replay_turns(ctx, cut["path"])
         n = 0
         for sid, path in window(ctx):
+            ctx.store.write(STATE, dict(doc, replaying={"session_id": sid, "path": path}))
             if fold.fold_session(ctx, sid, path, source="backfill") is None:
                 continue
             if ctx.config.loopguard != "off":
                 replay_turns(ctx, path)
             n += 1
         doc = ctx.store.read(STATE) or {}
+        doc.pop("replaying", None)
+        # Added to what a run before it read and no session start has announced yet: a second
+        # job left by a concurrent start finds nothing, and must not erase the first one's count.
         ctx.store.write(STATE, dict(doc, finished=time.time(), read=n,
-                                    noticed=not (announce and n)))
+                                    unannounced=int(doc.get("unannounced") or 0)
+                                    + (n if announce else 0)))
         return n
 
 
@@ -133,15 +154,14 @@ def start(ctx):
 
 def notice(ctx, command):
     """Once, after a job read anything: a sentence saying how many sessions (else None)."""
-    doc = ctx.store.read(STATE) or {}
-    if doc.get("noticed", True):
+    if not (ctx.store.read(STATE) or {}).get("unannounced"):
         return None
     with ctx.store.locked("backfill", timeout=0) as got:
         if not got:
             return None
         doc = ctx.store.read(STATE) or {}
-        if doc.get("noticed", True):
+        if not doc.get("unannounced"):
             return None
-        ctx.store.write(STATE, dict(doc, noticed=True))
-    return (f"TokenEconomizer read {doc.get('read', 0)} earlier {ctx.host.name} session(s) of "
+        ctx.store.write(STATE, dict(doc, unannounced=0))
+    return (f"TokenEconomizer read {doc['unannounced']} earlier {ctx.host.name} session(s) of "
             f"{ctx.repo.label} from this agent's own logs (`{command}`).")

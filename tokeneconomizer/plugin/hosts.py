@@ -362,17 +362,29 @@ class Codex(Host):
         return dict(h, started=_epoch(h.get("started")))
 
     def history_turns(self, path):
-        # PostToolUse names a command `Bash`, its output a plain string with no exit code
-        # (0.153.1); a file change comes as `apply_patch`, whose file headers are what
-        # `tool_call` reads of its patch.
+        # PostToolUse names a command `Bash` with the script the model wrote, not the argv the
+        # rollout records (`bash -lc '<script>'`), and its output a plain string with no exit
+        # code (0.153.1); a file change comes as `apply_patch`, whose file headers are what
+        # `tool_call` reads of its patch. An MCP call is named as Claude Code names one (its
+        # Codex payload was not observed).
         out = []
         for t in trace.codex_prompt_turns(path):
             payloads = []
             for item in t["items"]:
                 if item["type"] == "command_execution":
-                    payloads.append({"tool_name": "Bash",
-                                     "tool_input": {"command": item.get("command") or ""},
+                    cmd = item.get("command") or ""
+                    try:
+                        argv = shlex.split(cmd)
+                    except ValueError:
+                        argv = []
+                    if (len(argv) == 3 and os.path.basename(argv[0]) in ("bash", "sh", "zsh")
+                            and argv[1].startswith("-") and "c" in argv[1]):
+                        cmd = argv[2]
+                    payloads.append({"tool_name": "Bash", "tool_input": {"command": cmd},
                                      "tool_response": item.get("aggregated_output") or ""})
+                elif item["type"] == "mcp_tool_call":
+                    payloads.append({"tool_name": f"mcp__{item.get('server')}__{item.get('tool')}",
+                                     "tool_input": {}, "tool_response": item.get("result")})
                 else:
                     patch = "".join(f"*** Update File: {c['path']}\n"
                                     for c in item.get("changes") or ()

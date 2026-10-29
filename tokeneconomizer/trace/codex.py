@@ -217,8 +217,9 @@ def _turn_starts(rollout_path):
 
 
 def codex_prompt_turns(rollout_path):
-    """The session's prompt-turns in order (`_turn_starts`): per turn, its commands and file
-    changes in the exec shape (`rollout_item_to_exec`), and whether it was aborted."""
+    """The session's prompt-turns in order (`_turn_starts`): per turn, its commands, file
+    changes and MCP tool calls in the exec shape (`rollout_item_to_exec`), and whether it was
+    aborted."""
     starts = _turn_starts(rollout_path)
     turns = []
     for d in _records(rollout_path):
@@ -232,7 +233,7 @@ def codex_prompt_turns(rollout_path):
             turns[-1]["interrupted"] = True
         elif p.get("type") == "item_completed":
             item = rollout_item_to_exec(p.get("item") or {})
-            if item and item["type"] in ("command_execution", "file_change"):
+            if item and item["type"] in ("command_execution", "file_change", "mcp_tool_call"):
                 turns[-1]["items"].append(item)
     return turns
 

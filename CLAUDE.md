@@ -51,3 +51,12 @@ agent behavior, and `docs/ARCHITECTURE.md` for how the package fits together.
   decides should be checked against recorded sessions, not only the unit tests.
 - Every model-backed test goes through the agent's own CLI on a provider you control
   (OpenRouter in development); never hard-code a key.
+
+
+<!-- pr-kit:start -->
+## Pull requests
+
+- Open every PR with `.claude/skills/open-pr/SKILL.md` and land it with `.claude/skills/land-pr/SKILL.md`. Read the full skill before use.
+- The PR body has five fixed sections: Problem, Change, Proof, Review, Merge danger. Merge danger names the door and the blast radius.
+- The open-pr gate and the `pr-kit` CI check refuse a body that breaks the contract. Fix the body. Never route around either.
+<!-- pr-kit:end -->

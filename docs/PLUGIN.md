@@ -13,7 +13,7 @@ the hooks run) and `plugin/` (the packaging for each agent). To install and use 
 
 | Hook | What the plugin does | Mechanism it drives |
 |---|---|---|
-| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen | microskills |
+| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; the first time in a repository, leaves a detached `te backfill` that reads the agent's own logs of the sessions it ran there before (§4), and says once at a later start how many it read | microskills, toolprune, ledger, loopguard |
 | `UserPromptSubmit` | Opens a prompt-turn for the loop guard | loopguard |
 | `PostToolUse` | Folds the call into the turn's guard; delivers a redirect as `additionalContext`, then, if the turn is still stuck, a one-line notice to the person (on Claude Code, also as context asking the model to repeat it); never stops the turn | loopguard |
 | `PostToolUseFailure` | The same, for a call that failed (Claude Code and Copilot report a failed call only here); the answer names this event, as Claude Code requires | loopguard |
@@ -539,6 +539,23 @@ Which repository a session belongs to (`plugin/paths.py`, `plugin/repos.py`):
   keys counts once, at its later fold. Nothing is deleted: a merged directory moves to
   `merged/`, displaced learned state to `premerge-*`. `te repos merge KEY [INTO]` joins two by
   hand, for state whose checkouts are gone.
+
+**Sessions from before the plugin** (`plugin/backfill.py`). The first session start in a
+repository, on an agent whose logs the plugin reads (Claude Code's `~/.claude/projects`, honouring
+`CLAUDE_CONFIG_DIR`; Codex's `~/.codex/sessions`, honouring `CODEX_HOME`), leaves a detached
+`te backfill`. It takes the logs whose first directory resolves to the repository's key now, as a
+live session's does (a subdirectory, a clone, a worktree), leaves out subagents' logs (Claude
+Code's `<id>/subagents/`, a Codex thread whose `source` names a parent), logs written within the
+last ten minutes, logs whose directory is gone and sessions without a tool call, and of those
+reads the most recent `backfill_sessions` (50), oldest first. Each goes through the same
+`fold_session` as a finished session, its ledger record marked `source: "backfill"`, and then
+each of its prompt-turns through `TurnGuard`, call by call from the PostToolUse payload its hooks
+would have received; a turn that was not interrupted and ended green enters the envelope, as at
+its `Stop`. Nothing is decided in that replay (no envelope, no judge): the session ran unguarded.
+A session counts as read once `folded.json` holds its id or its log, as the live fold leaves it,
+or once the hooks recorded it, so running again (`te backfill`) adds only what is missing.
+`backfill.json` records the run; the job takes a lock, so concurrent session starts run it once.
+With micro-skills on, the proposer runs over those sessions as it would have, through the agent.
 
 The state directory, like the agents' own session logs it is derived from, is private to you:
 the plugin creates it `0700` and its files `0600`, and tightens a looser one it finds.

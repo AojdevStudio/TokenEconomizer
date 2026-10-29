@@ -24,6 +24,9 @@
                                       now (runs by itself, once, after an upgrade)
     te repos merge KEY [INTO]         merge the state directory KEY into INTO (default: this
                                       repository's), for state whose checkouts are gone
+    te backfill                       read the sessions this agent ran here before the plugin
+                                      saw them, from its own logs (the first session start
+                                      runs it, in the background; `backfill=off` stops that)
     te doctor                         check the installation
     te --host copilot probe           real Copilot sessions in a throwaway repository: does a
                                       learned fact change what the model does, and what does the
@@ -42,7 +45,8 @@ import sys
 import time
 
 from .. import loopguard
-from . import accounting, denylist, fold, hosts, paths, repomap, repos, sidecall, toolcheck
+from . import (accounting, backfill, denylist, fold, hosts, paths, repomap, repos, sidecall,
+               toolcheck)
 from .config import canonical, unset_config, write_config
 from .context import LiveContext
 from .paths import state_root
@@ -150,7 +154,9 @@ def cmd_status(args):
         print(f"  warning      {w}")
     if out["session_note"]:
         print(f"  note         {out['session_note']}")
-    print(f"  sessions     {ledger['sessions']} folded, "
+    print(f"  sessions     {ledger['sessions']} folded"
+          + (f" ({ledger['backfilled_sessions']} from the agent's earlier logs)"
+             if ledger["backfilled_sessions"] else "") + ", "
           f"{accounting.fmt_tokens(ledger['effective_tokens'])} effective tokens, plugin "
           f"overhead {accounting.fmt_tokens(ledger['overhead_tokens'])} "
           f"({ledger['overhead_frac']:.1%})")
@@ -513,6 +519,21 @@ def cmd_fold(args):
     return 0
 
 
+def cmd_backfill(args):
+    ctx = _ctx(args)
+    if _refuse_unwritable(ctx.store.base):
+        return 1
+    n = backfill.run(ctx, announce=args.quiet)
+    if n is None:
+        print("another backfill is reading this repository's sessions; try again in a minute")
+        return 1
+    if not args.quiet:
+        print(f"read {n} earlier {ctx.host.name} session(s) of {ctx.repo.label} "
+              f"(the most recent {ctx.config.backfill_sessions} that started here, less those "
+              f"already read)")
+    return 0
+
+
 def cmd_judge(args):
     """The detached half of the stuck judge (see plugin/judge.py); not for people."""
     from . import judge
@@ -735,6 +756,9 @@ def build_parser():
     p.add_argument("--session", action="append")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=cmd_fold)
+    p = add("backfill")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_backfill)
     p = add("judge")
     p.add_argument("--session", required=True)
     p.add_argument("--job", required=True)

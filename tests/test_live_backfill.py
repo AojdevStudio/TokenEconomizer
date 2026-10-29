@@ -226,6 +226,39 @@ def test_a_session_recorded_by_a_killed_job_is_folded_by_the_next(env, repo, mon
     assert ctx.store.read("envelope.json")["resolved_turns"] == [2]
 
 
+def test_a_killed_rebuild_is_finished_by_the_next_run_and_announced_once(
+        env, repo, tmp_path, monkeypatch):
+    _upgrade(env, repo, tmp_path)
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+    real = fold.fold_session
+
+    def killed_after_two(c, sid, *a, **k):
+        if sid == "trap2":
+            raise KeyboardInterrupt
+        return real(c, sid, *a, **k)
+    monkeypatch.setattr(fold, "fold_session", killed_after_two)
+    with pytest.raises(KeyboardInterrupt):
+        backfill.run(ctx)
+    monkeypatch.undo()
+    assert backfill.run(ctx) == 3
+    assert [r["session_id"] for r in ledger(env, repo)] == [
+        *(f"trap{i}" for i in range(5)), *(f"live{i}" for i in range(3))]
+    assert "read 5 earlier" in backfill.notice(ctx, "te status")
+
+
+def test_a_recorded_session_that_was_resumed_is_left_to_its_own_end(env, repo, monkeypatch):
+    log = past(env, repo, "old", 1, [("go", edit_and_test(repo))])
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+    monkeypatch.setattr(fold, "fold_session", lambda *a, **k: (_ for _ in ()).throw(
+        KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        backfill.run(ctx)
+    monkeypatch.undo()
+    os.utime(log)                                      # resumed: its log is written again
+    assert backfill.run(ctx) == 0
+    assert ledger(env, repo) == []
+
+
 def test_sessions_a_killed_job_read_are_still_announced(env, repo, monkeypatch):
     for i in range(3):
         past(env, repo, f"old{i}", 3 - i, [("go", edit_and_test(repo))])

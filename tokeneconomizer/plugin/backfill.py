@@ -162,7 +162,7 @@ def _unfold_after(ctx, since):
         os.replace(tmp, ctx.store.path("ledger.jsonl"))
         for sid in ids & set(recs):
             ctx.store.write(os.path.join("sessions", f"{sid}.json"),
-                            dict(recs[sid], folded=False))
+                            dict(recs[sid], folded=False, unfolded=True))
     return again
 
 
@@ -182,9 +182,16 @@ def run(ctx, announce=True):
                 return None
             todo = [(t, sid, path, "new") for t, sid, path in window(ctx)]
             folded = ctx.store.read("folded.json") or {}
-            todo += [(float(rec.get("started") or 0), sid, rec.get("transcript"), "stranded")
-                     for sid, rec in _records(ctx).items()
-                     if rec.get("origin") == "backfill" and sid not in folded]
+            # What a killed run left unfolded: a session it recorded, or one its rebuild
+            # unmarked (read before, so not announced again). One whose log is being written
+            # was resumed, and its own end folds it.
+            for sid, rec in _records(ctx).items():
+                log = rec.get("transcript") or ""
+                if sid not in folded and (rec.get("origin") == "backfill" or rec.get("unfolded")) \
+                        and os.path.exists(log) \
+                        and time.time() - os.path.getmtime(log) >= fold.STALE_S:
+                    todo.append((float(rec.get("started") or 0), sid, log,
+                                 "again" if rec.get("unfolded") else "stranded"))
             todo.sort()
             again = _unfold_after(ctx, todo[0][0]) if todo else []
             if again is None:

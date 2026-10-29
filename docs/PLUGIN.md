@@ -563,7 +563,9 @@ is folded again with the history, oldest first, as after a merge, the job holdin
 throughout so that no live fold lands in between. When a folded session's log is gone, the
 history is folded after the rest instead: out of order, but nothing it taught is lost. While one
 of those sessions is still running (resumed), the job leaves and a later session start tries
-again. A session that starts during a rebuild gets no facts, since the learned state is being
+again. The job holds the fold lock for its whole run, rebuild or not, so a session that ends
+meanwhile is folded after the history, not in the middle of it: its fold waits for the job, or,
+past `FOLD_LOCK_WAIT_S`, stays pending for the next session start. A session that starts during a rebuild gets no facts, since the learned state is being
 rebuilt; with micro-skills' proposer on, that can last as long as its calls.
 `backfill.json` records the run; the job takes a lock, so concurrent session starts run it once.
 With micro-skills on, the proposer runs over those sessions as it would have, through the agent.

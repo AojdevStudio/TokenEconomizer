@@ -91,6 +91,68 @@ def claude_prompt_count(transcript_path):
     return n
 
 
+def _text(content):
+    if isinstance(content, list):
+        return " ".join(b.get("text") or "" for b in content if isinstance(b, dict))
+    return content if isinstance(content, str) else ""
+
+
+def claude_prompt_turns(transcript_path):
+    """The session's prompt-turns in order: per prompt the person gave (`_is_prompt`), the tool
+    calls that came back with a result, as [(name, args, result_text, is_error)], and whether
+    the person interrupted the turn. Calls before the first prompt belong to no turn, and a
+    subagent's (`isSidechain`) to the subagent."""
+    turns, pending = [], {}
+    for line in _lines(transcript_path):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") not in CONVERSATION \
+                or ev.get("isSidechain"):
+            continue
+        if _is_prompt(ev):
+            turns.append({"calls": [], "interrupted": False})
+            continue
+        if not turns:
+            continue
+        turn = turns[-1]
+        content = (ev.get("message") or {}).get("content")
+        if ev.get("type") == "user" and _text(content).startswith("[Request interrupted"):
+            turn["interrupted"] = True
+        for b in content if isinstance(content, list) else ():
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("id") not in pending:
+                pending[b.get("id")] = (b.get("name") or "", b.get("input") or {})
+            elif b.get("type") == "tool_result" and b.get("tool_use_id") in pending:
+                name, args = pending.pop(b["tool_use_id"])
+                turn["calls"].append((name, args, _text(b.get("content")),
+                                      bool(b.get("is_error"))))
+    return turns
+
+
+def claude_session_header(transcript_path, max_lines=400):
+    """{session_id, cwd, started, sidechain} of a Claude Code transcript, from its first
+    entries: the directory it started in, and its first timestamp (ISO 8601)."""
+    head = {"session_id": os.path.splitext(os.path.basename(transcript_path))[0]}
+    for i, line in enumerate(_lines(transcript_path)):
+        if i >= max_lines or ("cwd" in head and "started" in head):
+            break
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if isinstance(ev.get("timestamp"), str):
+            head.setdefault("started", ev["timestamp"])
+        if isinstance(ev.get("cwd"), str):
+            head.setdefault("cwd", ev["cwd"])
+            head.setdefault("sidechain", bool(ev.get("isSidechain")))
+    return head
+
+
 
 def claude_subagent_files(transcript_path):
     """Subagent transcripts of a Claude Code session: `<dir>/<session-id>/subagents/*.jsonl`."""

@@ -525,7 +525,7 @@ def cmd_backfill(args):
         return 1
     n = backfill.run(ctx, announce=args.quiet)
     if n is None:
-        print("another backfill is reading this repository's sessions; try again in a minute")
+        print("another backfill, or a fold, holds this repository's state; try again in a minute")
         return 1
     if not args.quiet:
         print(f"read {n} earlier {ctx.host.name} session(s) of {ctx.repo.label} "

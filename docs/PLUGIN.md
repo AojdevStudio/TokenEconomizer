@@ -559,7 +559,9 @@ it elsewhere has it folded again there, and a job killed between a fold and its 
 the replay to the next run. Facts and tool evidence depend on the order sessions ran in, so when
 the history is older than a session already folded (an upgrade, or a larger
 `backfill_sessions`), the learned state is set aside (`prebackfill-*`) and every folded session
-whose log still exists is folded again with the history, oldest first, as after a merge.
+is folded again with the history, oldest first, as after a merge, the job holding the fold lock
+throughout so that no live fold lands in between. When a folded session's log is gone, the
+history is folded after the rest instead: out of order, but nothing it taught is lost.
 `backfill.json` records the run; the job takes a lock, so concurrent session starts run it once.
 With micro-skills on, the proposer runs over those sessions as it would have, through the agent.
 

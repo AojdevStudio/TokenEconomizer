@@ -25,8 +25,9 @@ Stop hooks would have.
   * In order. Micro-skills and tool pruning learn in the order sessions ran: a fact later
     sessions retired must stay retired. When the window holds a session older than one already
     folded, the learned state is set aside (`prebackfill-*`, nothing is deleted) and every folded
-    session whose log still exists is folded again, with the window's, oldest first, as `repos`
-    does after a merge.
+    session is folded again, with the window's, oldest first, as `repos` does after a merge. That
+    needs every folded session's log: when one is gone, the history is folded after them instead,
+    out of order, rather than lose what that session taught.
   * One job at a time. `backfill.json` says a job was started and when it finished; concurrent
     session starts may each leave one, and the job takes the `backfill` lock or leaves (or, run
     after the first, reads nothing new). A job that died is started again by a session start
@@ -34,6 +35,7 @@ Stop hooks would have.
 """
 import json
 import os
+import tempfile
 import time
 
 from .. import loopguard
@@ -122,58 +124,74 @@ def _records(ctx):
 
 
 def _unfold_after(ctx, since):
-    """When a folded session started after `since`: set the learned state aside and unmark every
-    folded session whose log still exists, its ledger record dropped (its fold writes it again).
-    Returns [(started, session id)] to fold again, [] when the order holds already."""
-    with ctx.store.locked("fold", timeout=fold.FOLD_LOCK_WAIT_S) as got:
-        folded = ctx.store.read("folded.json") or {}
-        recs = _records(ctx)
-        again = [(float(recs[sid].get("started") or 0), sid) for sid in folded
-                 if sid in recs and os.path.exists(recs[sid].get("transcript") or "")]
-        if not got or not any(t > since for t, _ in again):
+    """When a folded session started after `since`, and every folded session's log still exists
+    to fold it again from: set the learned state aside and unmark them all, their ledger records
+    dropped (their folds write them again). Returns [(started, session id, log)] to fold again,
+    [] when the order holds already, or when a log is gone: then the history is folded after
+    them, since folding again without that session would lose what it taught. The caller holds
+    the fold lock."""
+    folded = ctx.store.read("folded.json") or {}
+    recs = _records(ctx)
+    again = []
+    for sid, entry in folded.items():
+        log = (entry or {}).get("transcript") or recs.get(sid, {}).get("transcript") or ""
+        if not os.path.exists(log):
             return []
-        ids = {sid for _, sid in again}
-        with ctx.store.locked("mechanisms"):
-            aside = ctx.store.path(f"prebackfill-{time.strftime('%Y%m%d-%H%M%S')}")
-            for name in LEARNED:
-                if os.path.lexists(ctx.store.path(name)):
-                    os.makedirs(aside, exist_ok=True)
-                    os.replace(ctx.store.path(name), os.path.join(aside, name))
-            ctx.store.write("folded.json", {s: v for s, v in folded.items() if s not in ids})
-            keep = [r for r in ctx.store.read_lines("ledger.jsonl")
-                    if not (r.get("kind") == "session" and r.get("session_id") in ids)]
-            tmp = ctx.store.path(f"ledger.jsonl.{os.getpid()}.tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.writelines(json.dumps(r, sort_keys=True) + "\n" for r in keep)
-            os.replace(tmp, ctx.store.path("ledger.jsonl"))
-            for sid in ids:
-                ctx.store.write(os.path.join("sessions", f"{sid}.json"),
-                                dict(recs[sid], folded=False))
-        return again
+        again.append((float(recs.get(sid, {}).get("started")
+                            or ctx.host.history_session(log).get("started") or 0), sid, log))
+    if not any(t > since for t, _, _ in again):
+        return []
+    ids = set(folded)
+    with ctx.store.locked("mechanisms"):
+        aside = None
+        for name in LEARNED:
+            if os.path.lexists(ctx.store.path(name)):
+                aside = aside or tempfile.mkdtemp(
+                    prefix=time.strftime("prebackfill-%Y%m%d-%H%M%S-"), dir=ctx.store.base)
+                os.replace(ctx.store.path(name), os.path.join(aside, name))
+        ctx.store.write("folded.json", {})
+        keep = [r for r in ctx.store.read_lines("ledger.jsonl")
+                if not (r.get("kind") == "session" and r.get("session_id") in ids)]
+        tmp = ctx.store.path(f"ledger.jsonl.{os.getpid()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(r, sort_keys=True) + "\n" for r in keep)
+        os.replace(tmp, ctx.store.path("ledger.jsonl"))
+        for sid in ids & set(recs):
+            ctx.store.write(os.path.join("sessions", f"{sid}.json"),
+                            dict(recs[sid], folded=False))
+    return again
 
 
 def run(ctx, announce=True):
-    """Read the window's sessions, folding again those already folded that started after the
-    oldest of them (`_unfold_after`), then replay the turns of every backfilled session not
-    replayed yet. Returns how many sessions were read, or None while another run holds the
-    lock. With `announce`, the next session start says how many."""
+    """Read the window's sessions, with those a killed run recorded but never folded, folding
+    again the folded sessions that started after the oldest of them (`_unfold_after`); then
+    replay the turns of every backfilled session not replayed yet. It holds the fold lock
+    throughout, so no live fold lands in the middle of that order. Returns how many sessions
+    were read, or None while another run, or a fold past its wait, holds a lock. With
+    `announce`, the next session start says how many."""
     with ctx.store.locked("backfill", timeout=0) as got:
         if not got:
             return None
-        todo = window(ctx)
-        again = _unfold_after(ctx, todo[0][0]) if todo else []
-        n = 0
-        for started, sid, path in sorted(todo + [(t, sid, None) for t, sid in again]):
-            if path is None:
-                fold.fold_session(ctx, sid)
-                continue
-            info = ctx.host.history_session(path)
-            ctx.store.write(os.path.join("sessions", f"{sid}.json"), {
-                "session_id": sid, "host": ctx.host.name, "origin": "backfill",
-                "cwd": info.get("cwd"), "transcript": path, "started": started,
-                "ended": os.path.getmtime(path), "turns": [], "replayed": False})
-            if fold.fold_session(ctx, sid, path, source="backfill") is not None:
-                n += 1
+        with ctx.store.locked("fold", timeout=fold.FOLD_LOCK_WAIT_S) as held:
+            if not held:
+                return None
+            todo = [(t, sid, path, "new") for t, sid, path in window(ctx)]
+            folded = ctx.store.read("folded.json") or {}
+            todo += [(float(rec.get("started") or 0), sid, rec.get("transcript"), "stranded")
+                     for sid, rec in _records(ctx).items()
+                     if rec.get("origin") == "backfill" and sid not in folded]
+            todo.sort()
+            again = _unfold_after(ctx, todo[0][0]) if todo else []
+            n = 0
+            for started, sid, path, kind in sorted(todo + [(*a, "again") for a in again]):
+                if kind == "new":
+                    info = ctx.host.history_session(path)
+                    ctx.store.write(os.path.join("sessions", f"{sid}.json"), {
+                        "session_id": sid, "host": ctx.host.name, "origin": "backfill",
+                        "cwd": info.get("cwd"), "transcript": path, "started": started,
+                        "ended": os.path.getmtime(path), "turns": [], "replayed": False})
+                rec = fold.fold_session(ctx, sid, path, held=True)
+                n += rec is not None and kind != "again"
         if ctx.config.loopguard != "off":
             recs = _records(ctx)
             for sid, rec in sorted(recs.items(), key=lambda kv: float(kv[1].get("started") or 0)):

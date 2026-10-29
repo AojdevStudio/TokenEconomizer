@@ -19,6 +19,7 @@ Each session is folded once, at its first end, keyed by session id; a resumed se
 re-folded, because counting the same trajectory twice would hand the fact lifecycle confirmations
 it did not earn.
 """
+import contextlib
 import os
 import shutil
 import tempfile
@@ -355,12 +356,14 @@ def schedule_pending(ctx):
 CODEX_HIGH_RISK = frozenset({"image_media"})
 
 
-def fold_session(ctx, session_id, transcript_path=None, source=None):
+def fold_session(ctx, session_id, transcript_path=None, source=None, held=False):
     """Fold one finished session. Returns the ledger record, or None if already folded.
     `source` marks where the session came from in its ledger record (`backfill`: the agent's
-    own log of a session the hooks never saw), else its record's `origin`."""
+    own log of a session the hooks never saw), else its record's `origin`. `held`: the caller
+    holds the fold lock already (`backfill`, through a rebuild that must not interleave)."""
     sess_name = os.path.join("sessions", f"{session_id}.json")
-    with ctx.store.locked("fold", timeout=FOLD_LOCK_WAIT_S) as got:
+    with (contextlib.nullcontext(True) if held
+          else ctx.store.locked("fold", timeout=FOLD_LOCK_WAIT_S)) as got:
         if not got:
             return None
         folded = ctx.store.read("folded.json") or {}

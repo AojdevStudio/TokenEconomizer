@@ -16,7 +16,7 @@ import pytest
 from tests.test_live_core import _git_repo
 from tests.test_live_hooks import (call, repo, run_session, store_for,  # noqa: F401
                                    trap_session, write_session)
-from tokeneconomizer.plugin import backfill, cli, hosts
+from tokeneconomizer.plugin import backfill, cli, fold, hosts
 from tokeneconomizer.plugin.context import LiveContext
 
 DAY = 86400
@@ -144,21 +144,72 @@ def test_history_older_than_folded_sessions_is_learned_in_the_order_it_ran(
         env, repo, tmp_path):
     """Five old sessions meet a trap (bare `pytest` missing); three later ones, which the hooks
     saw, run it fine. Learned oldest first, the fact forms and is retired again."""
+    _upgrade(env, repo, tmp_path)
+    start(env, repo)
+    assert [(r["session_id"], r.get("source")) for r in ledger(env, repo)] == [
+        *((f"trap{i}", "backfill") for i in range(5)), *((f"live{i}", None) for i in range(3))]
+    assert "pytest" not in store_for(env, repo).read("injection.json")["rendered"]
+    assert len(glob.glob(store_for(env, repo).path("prebackfill-*"))) == 1
+
+
+def _upgrade(env, repo, tmp_path):
+    """Three later sessions the hooks saw run bare `pytest` fine; five older ones in the history
+    met it missing. Returns the live sessions' logs."""
     def fixed(path, i):
         return write_session(path, [(f"fix {i}", [
             ("Edit", {"file_path": f"{repo}/pkg/f{i}.py", "old_string": "a", "new_string": "b"},
              "ok", False),
             ("Bash", {"command": "pytest -q tests/test_a.py"}, "1 passed in 0.1s", False)])])
-    for i in range(3):
-        run_session(dict(env, TE_BACKFILL="off"), repo, f"live{i}",
-                    fixed(str(tmp_path / f"live{i}.jsonl"), i))
+    logs = [fixed(str(tmp_path / f"live{i}.jsonl"), i) for i in range(3)]
+    for i, log in enumerate(logs):
+        run_session(dict(env, TE_BACKFILL="off"), repo, f"live{i}", log)
     for i in range(5):
         past(env, repo, f"trap{i}", 12 - i, writer=lambda p, i=i: trap_session(p, repo, i))
+    return logs
+
+
+def test_a_session_start_during_the_rebuild_cannot_fold_out_of_order(
+        env, repo, tmp_path, monkeypatch):
+    _upgrade(env, repo, tmp_path)
+    unfold = backfill._unfold_after
+    monkeypatch.setattr(fold, "FOLD_LOCK_WAIT_S", 0.1)
+
+    def then_a_session_starts(*a):
+        again = unfold(*a)
+        start(env, repo, "concurrent")             # its fold of the unmarked sessions waits
+        return again
+    monkeypatch.setattr(backfill, "_unfold_after", then_a_session_starts)
     start(env, repo)
-    assert [(r["session_id"], r.get("source")) for r in ledger(env, repo)] == [
-        *((f"trap{i}", "backfill") for i in range(5)), *((f"live{i}", None) for i in range(3))]
+    assert [r["session_id"] for r in ledger(env, repo)] == [
+        *(f"trap{i}" for i in range(5)), *(f"live{i}" for i in range(3))]
     assert "pytest" not in store_for(env, repo).read("injection.json")["rendered"]
-    assert os.path.isdir(next(iter(glob.glob(store_for(env, repo).path("prebackfill-*")))))
+
+
+def test_with_a_folded_sessions_log_gone_history_is_added_without_a_rebuild(
+        env, repo, tmp_path):
+    logs = _upgrade(env, repo, tmp_path)
+    os.remove(logs[0])
+    start(env, repo)
+    assert [r["session_id"] for r in ledger(env, repo)] == [
+        *(f"live{i}" for i in range(3)), *(f"trap{i}" for i in range(5))]
+    assert store_for(env, repo).read("injection.json")["sessions"] == 8
+    assert not glob.glob(store_for(env, repo).path("prebackfill-*"))
+
+
+def test_a_session_recorded_by_a_killed_job_is_folded_by_the_next(env, repo, monkeypatch):
+    past(env, repo, "old", 1, [("go", edit_and_test(repo))])
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+
+    def killed(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(fold, "fold_session", killed)
+    with pytest.raises(KeyboardInterrupt):
+        backfill.run(ctx)
+    monkeypatch.undo()
+    assert ctx.store.read("sessions/old.json")["origin"] == "backfill"
+    assert backfill.run(ctx) == 1
+    assert [r["session_id"] for r in ledger(env, repo)] == ["old"]
+    assert ctx.store.read("envelope.json")["resolved_turns"] == [2]
 
 
 def test_a_backfilled_session_moved_by_a_merge_is_folded_again_where_it_lands(

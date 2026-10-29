@@ -128,8 +128,10 @@ def _unfold_after(ctx, since):
     to fold it again from: set the learned state aside and unmark them all, their ledger records
     dropped (their folds write them again). Returns [(started, session id, log)] to fold again,
     [] when the order holds already, or when a log is gone: then the history is folded after
-    them, since folding again without that session would lose what it taught. The caller holds
-    the fold lock."""
+    them, since folding again without that session would lose what it taught. None while one
+    of them is still running (a resumed session, its log written within `fold.STALE_S`): a fold
+    rewrites its record, which its hooks are writing too, so the run waits for a quiet moment.
+    The caller holds the fold lock."""
     folded = ctx.store.read("folded.json") or {}
     recs = _records(ctx)
     again = []
@@ -141,6 +143,8 @@ def _unfold_after(ctx, since):
                             or ctx.host.history_session(log).get("started") or 0), sid, log))
     if not any(t > since for t, _, _ in again):
         return []
+    if any(time.time() - os.path.getmtime(log) < fold.STALE_S for _, _, log in again):
+        return None
     ids = set(folded)
     with ctx.store.locked("mechanisms"):
         aside = None
@@ -167,8 +171,9 @@ def run(ctx, announce=True):
     again the folded sessions that started after the oldest of them (`_unfold_after`); then
     replay the turns of every backfilled session not replayed yet. It holds the fold lock
     throughout, so no live fold lands in the middle of that order. Returns how many sessions
-    were read, or None while another run, or a fold past its wait, holds a lock. With
-    `announce`, the next session start says how many."""
+    were read, or None when it must try again later: another run, or a fold past its wait,
+    holds a lock, or a session it would fold again is still running. With `announce`, the next
+    session start says how many."""
     with ctx.store.locked("backfill", timeout=0) as got:
         if not got:
             return None
@@ -182,6 +187,8 @@ def run(ctx, announce=True):
                      if rec.get("origin") == "backfill" and sid not in folded]
             todo.sort()
             again = _unfold_after(ctx, todo[0][0]) if todo else []
+            if again is None:
+                return None
             n = 0
             for started, sid, path, kind in sorted(todo + [(*a, "again") for a in again]):
                 if kind == "new":

@@ -163,6 +163,7 @@ def _upgrade(env, repo, tmp_path):
     logs = [fixed(str(tmp_path / f"live{i}.jsonl"), i) for i in range(3)]
     for i, log in enumerate(logs):
         run_session(dict(env, TE_BACKFILL="off"), repo, f"live{i}", log)
+        os.utime(log, (time.time() - 3600,) * 2)       # ended an hour ago
     for i in range(5):
         past(env, repo, f"trap{i}", 12 - i, writer=lambda p, i=i: trap_session(p, repo, i))
     return logs
@@ -194,6 +195,19 @@ def test_with_a_folded_sessions_log_gone_history_is_added_without_a_rebuild(
         *(f"live{i}" for i in range(3)), *(f"trap{i}" for i in range(5))]
     assert store_for(env, repo).read("injection.json")["sessions"] == 8
     assert not glob.glob(store_for(env, repo).path("prebackfill-*"))
+
+
+def test_a_rebuild_waits_while_a_session_it_would_fold_again_is_running(env, repo, tmp_path):
+    logs = _upgrade(env, repo, tmp_path)
+    os.utime(logs[2])                                  # live2 was resumed, and is running
+    ctx = LiveContext.build(hosts.HOSTS["claude"](), repo, env)
+    before = ctx.store.read("sessions/live2.json")
+    assert backfill.run(ctx) is None
+    assert ctx.store.read("sessions/live2.json") == before
+    assert [r["session_id"] for r in ledger(env, repo)] == [f"live{i}" for i in range(3)]
+    os.utime(logs[2], (time.time() - DAY,) * 2)        # it ended
+    assert backfill.run(ctx) == 5
+    assert [r["session_id"] for r in ledger(env, repo)][:5] == [f"trap{i}" for i in range(5)]
 
 
 def test_a_session_recorded_by_a_killed_job_is_folded_by_the_next(env, repo, monkeypatch):

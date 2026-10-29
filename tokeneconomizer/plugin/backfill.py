@@ -16,20 +16,30 @@ Stop hooks would have.
     included), and a session that called no tool. Of the rest, the most recent
     `backfill_sessions` are the window, read oldest first.
   * Read once. A session is processed when `folded.json` holds its id or its log, as it does for
-    the live fold, or when the hooks recorded it (the live fold's to fold). `fold_session` folds
-    a session once whoever asks, so a run never double-counts one, and running again folds only
-    what is still missing from the window.
+    the live fold, or when it has a record under `sessions/` (the hooks', or one backfill wrote).
+    `fold_session` folds a session once whoever asks, so a run never double-counts one, and
+    running again folds only what is still missing from the window. The record backfill writes
+    (`origin: "backfill"`) is what `repos` and the next session start need to fold the session
+    again after a merge, and it says whether its turns were replayed yet, so a job killed between
+    a session's fold and its replay leaves the replay to the next run.
+  * In order. Micro-skills and tool pruning learn in the order sessions ran: a fact later
+    sessions retired must stay retired. When the window holds a session older than one already
+    folded, the learned state is set aside (`prebackfill-*`, nothing is deleted) and every folded
+    session whose log still exists is folded again, with the window's, oldest first, as `repos`
+    does after a merge.
   * One job at a time. `backfill.json` says a job was started and when it finished; concurrent
     session starts may each leave one, and the job takes the `backfill` lock or leaves (or, run
     after the first, reads nothing new). A job that died is started again by a session start
     `RESPAWN_S` later.
 """
+import json
 import os
 import time
 
 from .. import loopguard
 from . import fold
 from .paths import repo_identity
+from .repos import LEARNED
 
 STATE = "backfill.json"
 RESPAWN_S = 3600
@@ -53,8 +63,8 @@ def _processed(ctx):
 
 
 def window(ctx, now=None):
-    """The past sessions of this repository to read: [(session id, log path)], oldest first,
-    those already processed left out."""
+    """The past sessions of this repository to read: [(started, session id, log path)], oldest
+    first, those already processed left out."""
     now = now or time.time()
     keys, found = {}, []
     for path in ctx.host.history_logs(ctx.env):
@@ -80,7 +90,7 @@ def window(ctx, now=None):
             break
         if any(payloads for payloads, _ in ctx.host.history_turns(path)):
             picked.append((started, sid, path, sid in ids or os.path.realpath(path) in logs))
-    return [(sid, path) for _, sid, path, done in sorted(picked) if not done]
+    return [(started, sid, path) for started, sid, path, done in sorted(picked) if not done]
 
 
 def replay_turns(ctx, path):
@@ -101,34 +111,78 @@ def replay_turns(ctx, path):
         loopguard.save_envelope(ctx.store, tracker)
 
 
-def _backfilled(ctx, session_id):
-    return any(r.get("session_id") == session_id and r.get("source") == "backfill"
-               for r in ctx.store.read_lines("ledger.jsonl"))
+def _records(ctx):
+    """{session id: record} under `sessions/`."""
+    try:
+        names = os.listdir(ctx.store.path("sessions"))
+    except OSError:
+        return {}
+    return {n[:-5]: ctx.store.read(os.path.join("sessions", n)) or {}
+            for n in names if n.endswith(".json")}
+
+
+def _unfold_after(ctx, since):
+    """When a folded session started after `since`: set the learned state aside and unmark every
+    folded session whose log still exists, its ledger record dropped (its fold writes it again).
+    Returns [(started, session id)] to fold again, [] when the order holds already."""
+    with ctx.store.locked("fold", timeout=fold.FOLD_LOCK_WAIT_S) as got:
+        folded = ctx.store.read("folded.json") or {}
+        recs = _records(ctx)
+        again = [(float(recs[sid].get("started") or 0), sid) for sid in folded
+                 if sid in recs and os.path.exists(recs[sid].get("transcript") or "")]
+        if not got or not any(t > since for t, _ in again):
+            return []
+        ids = {sid for _, sid in again}
+        with ctx.store.locked("mechanisms"):
+            aside = ctx.store.path(f"prebackfill-{time.strftime('%Y%m%d-%H%M%S')}")
+            for name in LEARNED:
+                if os.path.lexists(ctx.store.path(name)):
+                    os.makedirs(aside, exist_ok=True)
+                    os.replace(ctx.store.path(name), os.path.join(aside, name))
+            ctx.store.write("folded.json", {s: v for s, v in folded.items() if s not in ids})
+            keep = [r for r in ctx.store.read_lines("ledger.jsonl")
+                    if not (r.get("kind") == "session" and r.get("session_id") in ids)]
+            tmp = ctx.store.path(f"ledger.jsonl.{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.writelines(json.dumps(r, sort_keys=True) + "\n" for r in keep)
+            os.replace(tmp, ctx.store.path("ledger.jsonl"))
+            for sid in ids:
+                ctx.store.write(os.path.join("sessions", f"{sid}.json"),
+                                dict(recs[sid], folded=False))
+        return again
 
 
 def run(ctx, announce=True):
-    """Read the window's sessions. Returns how many were folded, or None while another run
-    holds the lock. With `announce`, the next session start says how many.
-
-    `replaying` in the state names the session between its fold and its turns' replay, so a run
-    killed there replays it at the next run: the fold marks it read, and nothing else would."""
+    """Read the window's sessions, folding again those already folded that started after the
+    oldest of them (`_unfold_after`), then replay the turns of every backfilled session not
+    replayed yet. Returns how many sessions were read, or None while another run holds the
+    lock. With `announce`, the next session start says how many."""
     with ctx.store.locked("backfill", timeout=0) as got:
         if not got:
             return None
-        doc = ctx.store.read(STATE) or {}
-        cut = doc.get("replaying")
-        if cut and ctx.config.loopguard != "off" and _backfilled(ctx, cut["session_id"]):
-            replay_turns(ctx, cut["path"])
+        todo = window(ctx)
+        again = _unfold_after(ctx, todo[0][0]) if todo else []
         n = 0
-        for sid, path in window(ctx):
-            ctx.store.write(STATE, dict(doc, replaying={"session_id": sid, "path": path}))
-            if fold.fold_session(ctx, sid, path, source="backfill") is None:
+        for started, sid, path in sorted(todo + [(t, sid, None) for t, sid in again]):
+            if path is None:
+                fold.fold_session(ctx, sid)
                 continue
-            if ctx.config.loopguard != "off":
-                replay_turns(ctx, path)
-            n += 1
+            info = ctx.host.history_session(path)
+            ctx.store.write(os.path.join("sessions", f"{sid}.json"), {
+                "session_id": sid, "host": ctx.host.name, "origin": "backfill",
+                "cwd": info.get("cwd"), "transcript": path, "started": started,
+                "ended": os.path.getmtime(path), "turns": [], "replayed": False})
+            if fold.fold_session(ctx, sid, path, source="backfill") is not None:
+                n += 1
+        if ctx.config.loopguard != "off":
+            recs = _records(ctx)
+            for sid, rec in sorted(recs.items(), key=lambda kv: float(kv[1].get("started") or 0)):
+                if rec.get("origin") == "backfill" and rec.get("folded") \
+                        and not rec.get("replayed"):
+                    replay_turns(ctx, rec["transcript"])
+                    ctx.store.write(os.path.join("sessions", f"{sid}.json"),
+                                    dict(rec, replayed=True))
         doc = ctx.store.read(STATE) or {}
-        doc.pop("replaying", None)
         # Added to what a run before it read and no session start has announced yet: a second
         # job left by a concurrent start finds nothing, and must not erase the first one's count.
         ctx.store.write(STATE, dict(doc, finished=time.time(), read=n,

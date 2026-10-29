@@ -358,7 +358,7 @@ CODEX_HIGH_RISK = frozenset({"image_media"})
 def fold_session(ctx, session_id, transcript_path=None, source=None):
     """Fold one finished session. Returns the ledger record, or None if already folded.
     `source` marks where the session came from in its ledger record (`backfill`: the agent's
-    own log of a session the hooks never saw)."""
+    own log of a session the hooks never saw), else its record's `origin`."""
     sess_name = os.path.join("sessions", f"{session_id}.json")
     with ctx.store.locked("fold", timeout=FOLD_LOCK_WAIT_S) as got:
         if not got:
@@ -367,6 +367,7 @@ def fold_session(ctx, session_id, transcript_path=None, source=None):
         if session_id in folded:
             return None
         sess = ctx.store.read(sess_name) or {}
+        source = source or sess.get("origin")
         transcript = transcript_path or sess.get("transcript")
         record = {"kind": "session", "session_id": session_id, "host": ctx.host.name,
                   "repo": ctx.repo.label, "folded_at": time.time(),

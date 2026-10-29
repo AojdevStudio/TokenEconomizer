@@ -5,6 +5,7 @@ Each test writes past sessions where the agent keeps them (`CLAUDE_CONFIG_DIR`, 
 under the test's directory), drives session starts through `hook.main`, and pins one property.
 The job runs inline (`TE_FOLD_SYNC=1`); in the plugin it is a detached `te backfill`.
 """
+import glob
 import json
 import os
 import re
@@ -13,7 +14,8 @@ import time
 import pytest
 
 from tests.test_live_core import _git_repo
-from tests.test_live_hooks import call, repo, store_for, trap_session, write_session  # noqa: F401
+from tests.test_live_hooks import (call, repo, run_session, store_for,  # noqa: F401
+                                   trap_session, write_session)
 from tokeneconomizer.plugin import backfill, cli, hosts
 from tokeneconomizer.plugin.context import LiveContext
 
@@ -123,7 +125,7 @@ def test_it_skips_this_session_read_running_subagent_and_tool_less_ones(env, rep
     assert [r["session_id"] for r in ledger(env, repo)] == ["parent"]
 
 
-def test_it_reads_the_most_recent_n_and_te_backfill_adds_only_what_is_missing(
+def test_it_reads_the_most_recent_n_and_te_backfill_adds_what_is_missing_in_order(
         env, repo, monkeypatch, capsys):
     for i in range(4):
         past(env, repo, f"old{i}", 4 - i, [("go", edit_and_test(repo))])
@@ -135,7 +137,45 @@ def test_it_reads_the_most_recent_n_and_te_backfill_adds_only_what_is_missing(
     assert capsys.readouterr().out.startswith("read 0 earlier claude session(s)")
     monkeypatch.setenv("TE_BACKFILL_SESSIONS", "50")
     assert cli.main(["--cwd", repo, "--host", "claude", "backfill"]) == 0
-    assert [r["session_id"] for r in ledger(env, repo)] == ["old2", "old3", "old0", "old1"]
+    assert [r["session_id"] for r in ledger(env, repo)] == ["old0", "old1", "old2", "old3"]
+
+
+def test_history_older_than_folded_sessions_is_learned_in_the_order_it_ran(
+        env, repo, tmp_path):
+    """Five old sessions meet a trap (bare `pytest` missing); three later ones, which the hooks
+    saw, run it fine. Learned oldest first, the fact forms and is retired again."""
+    def fixed(path, i):
+        return write_session(path, [(f"fix {i}", [
+            ("Edit", {"file_path": f"{repo}/pkg/f{i}.py", "old_string": "a", "new_string": "b"},
+             "ok", False),
+            ("Bash", {"command": "pytest -q tests/test_a.py"}, "1 passed in 0.1s", False)])])
+    for i in range(3):
+        run_session(dict(env, TE_BACKFILL="off"), repo, f"live{i}",
+                    fixed(str(tmp_path / f"live{i}.jsonl"), i))
+    for i in range(5):
+        past(env, repo, f"trap{i}", 12 - i, writer=lambda p, i=i: trap_session(p, repo, i))
+    start(env, repo)
+    assert [(r["session_id"], r.get("source")) for r in ledger(env, repo)] == [
+        *((f"trap{i}", "backfill") for i in range(5)), *((f"live{i}", None) for i in range(3))]
+    assert "pytest" not in store_for(env, repo).read("injection.json")["rendered"]
+    assert os.path.isdir(next(iter(glob.glob(store_for(env, repo).path("prebackfill-*")))))
+
+
+def test_a_backfilled_session_moved_by_a_merge_is_folded_again_where_it_lands(
+        env, repo, tmp_path, monkeypatch):
+    other = _git_repo(str(tmp_path / "other"), "https://github.com/acme/gadget.git")
+    for i in range(2):
+        past(env, other, f"o{i}", 4 - i, [("go", edit_and_test(other))])
+    start(env, other, "s-other")
+    past(env, repo, "mine", 1, [("go", edit_and_test(repo))])
+    start(env, repo, "s-mine")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    src = os.path.basename(os.path.dirname(store_for(env, repo).base))
+    assert cli.main(["--cwd", other, "--host", "claude", "repos", "merge", src]) == 0
+    start(env, other, "s-next")
+    assert sorted(r["session_id"] for r in ledger(env, other)) == ["mine", "o0", "o1"]
+    assert all(r["source"] == "backfill" for r in ledger(env, other))
 
 
 def test_backfill_off_leaves_the_history_alone(env, repo):

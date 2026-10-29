@@ -553,7 +553,13 @@ each of its prompt-turns through `TurnGuard`, call by call from the PostToolUse 
 would have received; a turn that was not interrupted and ended green enters the envelope, as at
 its `Stop`. Nothing is decided in that replay (no envelope, no judge): the session ran unguarded.
 A session counts as read once `folded.json` holds its id or its log, as the live fold leaves it,
-or once the hooks recorded it, so running again (`te backfill`) adds only what is missing.
+or once it has a session record, so running again (`te backfill`) adds only what is missing.
+Backfill writes a record for each session it reads (`origin: "backfill"`), so a merge that sends
+it elsewhere has it folded again there, and a job killed between a fold and its replay leaves
+the replay to the next run. Facts and tool evidence depend on the order sessions ran in, so when
+the history is older than a session already folded (an upgrade, or a larger
+`backfill_sessions`), the learned state is set aside (`prebackfill-*`) and every folded session
+whose log still exists is folded again with the history, oldest first, as after a merge.
 `backfill.json` records the run; the job takes a lock, so concurrent session starts run it once.
 With micro-skills on, the proposer runs over those sessions as it would have, through the agent.
 

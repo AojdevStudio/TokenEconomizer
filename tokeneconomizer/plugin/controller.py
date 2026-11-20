@@ -2,7 +2,9 @@
 
     SessionStart      inject the repository's micro-skills (cached by the last fold), and
                       fold any earlier session that ended without its SessionEnd being seen;
-                      with `repomap` on, refresh a stale map in the background
+                      the first time in a repository, read the sessions the agent ran there
+                      before, in the background (`backfill`); with `repomap` on, refresh a
+                      stale map in the background
     UserPromptSubmit  open a prompt-turn for the loop guard; on a session's first prompt, add
                       the repository map (`repomap=on`)
     PostToolUse       fold the call into the turn's guard; a redirect when it first says the
@@ -24,7 +26,7 @@ import os
 import time
 
 from .. import loopguard
-from . import denylist, fold, repomap, repos, sidecall
+from . import backfill, denylist, fold, repomap, repos, sidecall
 from .hosts import merge_outputs
 from .paths import ensure_launcher
 
@@ -153,6 +155,9 @@ class LiveController:
         note = repos.migration_notice(self.ctx.root, self._cmd("repos"))
         if note and not self.cfg.shadow:
             outputs.append(self.host.notice(note))
+        note = backfill.notice(self.ctx, self._cmd("status"))
+        if note and not self.cfg.shadow:
+            outputs.append(self.host.notice(note))
 
         if self.cfg.repomap != "off":
             if repomap.stale(self.ctx):
@@ -170,6 +175,7 @@ class LiveController:
         repos.prune_pins(self.ctx.root, self.host.name)
         repos.start_migration(self.ctx)
         fold.spawn_fold(self.ctx, fold.pending_sessions(self.ctx, exclude=(self.sid,)))
+        backfill.start(self.ctx)
         return merge_outputs(*outputs)
 
     def _toolprune_notices(self, seen):

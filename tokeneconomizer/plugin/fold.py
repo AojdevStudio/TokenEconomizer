@@ -19,6 +19,7 @@ Each session is folded once, at its first end, keyed by session id; a resumed se
 re-folded, because counting the same trajectory twice would hand the fact lifecycle confirmations
 it did not earn.
 """
+import contextlib
 import os
 import shutil
 import tempfile
@@ -355,21 +356,28 @@ def schedule_pending(ctx):
 CODEX_HIGH_RISK = frozenset({"image_media"})
 
 
-def fold_session(ctx, session_id, transcript_path=None):
-    """Fold one finished session. Returns the ledger record, or None if already folded."""
+def fold_session(ctx, session_id, transcript_path=None, source=None, held=False):
+    """Fold one finished session. Returns the ledger record, or None if already folded.
+    `source` marks where the session came from in its ledger record (`backfill`: the agent's
+    own log of a session the hooks never saw), else its record's `origin`. `held`: the caller
+    holds the fold lock already (`backfill`, through a rebuild that must not interleave)."""
     sess_name = os.path.join("sessions", f"{session_id}.json")
-    with ctx.store.locked("fold", timeout=FOLD_LOCK_WAIT_S) as got:
+    with (contextlib.nullcontext(True) if held
+          else ctx.store.locked("fold", timeout=FOLD_LOCK_WAIT_S)) as got:
         if not got:
             return None
         folded = ctx.store.read("folded.json") or {}
         if session_id in folded:
             return None
         sess = ctx.store.read(sess_name) or {}
+        source = source or sess.get("origin")
         transcript = transcript_path or sess.get("transcript")
         record = {"kind": "session", "session_id": session_id, "host": ctx.host.name,
                   "repo": ctx.repo.label, "folded_at": time.time(),
                   "started": sess.get("started"), "ended": sess.get("ended"),
                   "shadow": ctx.config.shadow}
+        if source:
+            record["source"] = source
         workdir = tempfile.mkdtemp(prefix="te-fold-")
         try:
             trace_path = ctx.host.mechanism_trace(transcript, workdir) if transcript else None

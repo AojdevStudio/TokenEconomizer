@@ -380,6 +380,17 @@ repository is not used by Codex there), while settings are shared by every agent
   edits through the same failures is redirected even if the judge disagrees. The plugin never
   stops a turn itself. Where the notice appears, and how to stop the turn, on each agent and in
   each mode: [When a turn gets stuck](../README.md#when-a-turn-gets-stuck).
+- **Earlier sessions.** The first session start in a repository leaves a background job that
+  reads the sessions the agent ran there before, from its own logs (Claude Code's
+  `~/.claude/projects`, Codex's `~/.codex/sessions`), and folds each as a session that just ended
+  is folded: facts, tool evidence, the loop guard's usual turn length, and the session's cost,
+  which `status` counts as read from the agent's logs. It reads the most recent
+  `backfill_sessions` (50) that started in the repository, a subdirectory, another clone or a
+  worktree, and leaves out subagents' logs, sessions still being written, sessions whose
+  directory is gone and sessions that called no tool. The next session start says how many, once.
+  With micro-skills on, its proposer runs every `microskills_propose_every` of those sessions, as
+  it would have, through the agent. `backfill=off` stops the job; `backfill` reads again, adding
+  only sessions not yet read. The Copilot CLI's, Pi's and opencode's logs are not read.
 - **Cost.** `status` shows each session's tokens, priced after it ends, and the plugin's own
   overhead: the loop guard's judge, and micro-skills' proposer when it is on.
 
@@ -401,6 +412,7 @@ repository is not used by Codex there), while settings are shared by every agent
 | `repos` | every repository it keeps state for: how it was identified, its sessions per agent, the checkouts seen |
 | `repos migrate` | file state an earlier version recorded under the repository it belongs to (runs by itself, once, after an upgrade) |
 | `repos merge KEY [INTO]` | merge one repository's state into another's (default: this one), for state whose checkouts are gone |
+| `backfill` | read the sessions the agent ran here before, from its own logs (the first session start does it in the background); only sessions not yet read are added |
 | `doctor` | check Python, the state directory, the agents found, how this directory was identified, and the error log |
 
 How to run them:
@@ -413,8 +425,8 @@ How to run them:
 | Pi | `/te <command>` | `~/.tokeneconomizer/bin/te --host pi <command>` |
 | opencode | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host opencode <command>` |
 
-`doctor` and `repomap` run from a terminal (or as `/te …` on Pi); there is no slash command or
-Codex skill for them.
+`doctor`, `repomap` and `backfill` run from a terminal (or as `/te …` on Pi); there is no slash
+command or Codex skill for them.
 
 Inside an agent, each command is one model turn; from a terminal it costs nothing. Codex asks
 before a command that changes something (`config set`, `toolprune restore`, ...), since it
@@ -507,6 +519,13 @@ of the preset. A value you set with `loopguard.<name>` wins over both. Defaults 
 | `repomap_tokens` | `2048` | the map's size, in tokens |
 | `repomap_python` | auto | the Python that has aider installed |
 | `repomap_timeout` | `8` | seconds the first prompt may wait for a ranked map before the cached one is used |
+
+**Earlier sessions** (Claude Code and Codex):
+
+| Key | Default | What it sets |
+|---|---|---|
+| `backfill` | `on` | at the first session start in a repository, read the agent's earlier sessions there in the background; `off`: leave them |
+| `backfill_sessions` | `50` | how many of the most recent earlier sessions are read |
 
 **Other settings:**
 

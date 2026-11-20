@@ -216,6 +216,42 @@ def _turn_starts(rollout_path):
 
 
 
+def codex_prompt_turns(rollout_path):
+    """The session's prompt-turns in order (`_turn_starts`): per turn, its commands, file
+    changes and MCP tool calls in the exec shape (`rollout_item_to_exec`), and whether it was
+    aborted."""
+    starts = _turn_starts(rollout_path)
+    turns = []
+    for d in _records(rollout_path):
+        if starts(d):
+            turns.append({"items": [], "interrupted": False})
+            continue
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        if not turns or d.get("type") != "event_msg":
+            continue
+        if p.get("type") == "turn_aborted":
+            turns[-1]["interrupted"] = True
+        elif p.get("type") == "item_completed":
+            item = rollout_item_to_exec(p.get("item") or {})
+            if item and item["type"] in ("command_execution", "file_change", "mcp_tool_call"):
+                turns[-1]["items"].append(item)
+    return turns
+
+
+def codex_session_header(rollout_path):
+    """{session_id, cwd, started, subagent} from a rollout's leading `session_meta` record: a
+    thread a session spawned names its parent in `source.subagent`."""
+    for d in _records(rollout_path):
+        if d.get("type") != "session_meta":
+            continue
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        source = p.get("source")
+        return {"session_id": p.get("id") or p.get("session_id"), "cwd": p.get("cwd"),
+                "started": p.get("timestamp") or d.get("timestamp"),
+                "subagent": isinstance(source, dict) and "subagent" in source}
+    return {}
+
+
 def codex_session_meta(rollout_path):
     """{cwd, model, cli_version} from a rollout's session_meta / turn_context records."""
     meta = {}

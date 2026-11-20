@@ -97,7 +97,9 @@ WINDOWS_ENV = ("OS", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT"
 def _hook_env(tmp_path, **extra):
     env = {k: os.environ[k] for k in WINDOWS_ENV if os.name == "nt" and k in os.environ}
     env.update({"PATH": os.environ.get("PATH", ""), "TOKENECONOMIZER_HOME": str(tmp_path / "home"),
-                "GIT_CEILING_DIRECTORIES": str(tmp_path), "TE_FOLD_SYNC": "1"})
+                "GIT_CEILING_DIRECTORIES": str(tmp_path), "TE_FOLD_SYNC": "1",
+                # Backfill would read the agent's own logs under the real home.
+                "TE_BACKFILL": "off"})
     env.update(extra)
     return env
 

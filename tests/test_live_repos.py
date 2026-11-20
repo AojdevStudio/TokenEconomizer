@@ -49,6 +49,8 @@ def env(tmp_path):
             # Facts are learned here without a model call. Micro-skills is off by default, and
             # its `on` adds the proposer; both have their own tests.
             "TE_MICROSKILLS": "envfacts",
+            # Backfill reads the agent's own logs under the real home; it has its own tests.
+            "TE_BACKFILL": "off",
             "GIT_CEILING_DIRECTORIES": str(tmp_path), "HOME": str(home),
             "PATH": os.environ.get("PATH", "")}
 
